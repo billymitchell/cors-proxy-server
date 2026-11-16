@@ -1,7 +1,7 @@
 require('dotenv').config(); // Load environment variables from .env
 const express = require('express');
 const cors = require('cors');
-const { createProxyMiddleware } = require('http-proxy-middleware');
+const { createProxyMiddleware, fixRequestBody } = require('http-proxy-middleware');
 const morgan = require('morgan'); // For logging HTTP requests
 
 const app = express();
@@ -19,7 +19,7 @@ app.use(express.json());
 // Authentication middleware
 app.use((req, res, next) => {
   try {
-    const accessToken = req.body.accessToken; // Expecting the token in the request body
+    const accessToken = req.body?.accessToken;
     const VALID_TOKEN = process.env.ACCESS_TOKEN; // Load token from .env
 
     if (!accessToken) {
@@ -42,34 +42,56 @@ app.use((req, res, next) => {
   }
 });
 
-// Proxy middleware with dynamic target
-app.use('*', createProxyMiddleware({
+app.use((req, res, next) => {
+  const target = req.query.target;
+  if (target === undefined || target === '') {
+    return res.status(400).json({ error: 'Target query parameter is required' });
+  }
+
+  let url;
+  try {
+    if (typeof target === 'string') url = new URL(target);
+  } catch {
+    return res.status(400).json({ error: 'Target must be an HTTP or HTTPS URL' });
+  }
+  if (!url || !['http:', 'https:'].includes(url.protocol)) {
+    return res.status(400).json({ error: 'Target must be an HTTP or HTTPS URL' });
+  }
+
+  req.proxyTarget = url.href;
+  delete req.body.accessToken;
+  next();
+});
+
+app.use(createProxyMiddleware({
   changeOrigin: true,
-  router: (req) => {
-    try {
-      // Extract the target server from the query parameter `target`
-      const target = req.query.target;
-      if (!target) {
-        // Log missing target error
-        console.error('Target query parameter is missing');
-        throw new Error('Target query parameter is required');
+  router: (req) => req.proxyTarget,
+  on: {
+    proxyReq(proxyReq, req) {
+      // The JSON parser inflates compressed bodies before the proxy rewrites them.
+      proxyReq.removeHeader('Content-Encoding');
+      fixRequestBody(proxyReq, req);
+    },
+    error(err, req, res) {
+      console.error('Proxy error:', err.message);
+      if (res.headersSent) {
+        res.destroy(err);
+        return;
       }
-      return target;
-    } catch (error) {
-      // Log unexpected errors
-      console.error('Error in proxy router:', error.message);
-      throw error; // Re-throw the error to be handled by the proxy middleware
-    }
-  },
-  onError: (err, req, res) => {
-    // Handle proxy errors
-    console.error('Proxy error:', err.message);
-    res.status(500).json({ error: 'Proxy error occurred' });
+      res.status(500).json({ error: 'Proxy error occurred' });
+    },
   },
 }));
 
 // Global error handler for unexpected errors
 app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'Invalid JSON body' });
+  }
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'JSON body is too large' });
+  }
   console.error('Unhandled error:', err.message);
   res.status(500).json({ error: 'Internal server error' });
 });
