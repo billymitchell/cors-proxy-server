@@ -1,102 +1,114 @@
-require('dotenv').config(); // Load environment variables from .env
+require('dotenv').config();
+const { timingSafeEqual } = require('node:crypto');
 const express = require('express');
 const cors = require('cors');
-const { createProxyMiddleware, fixRequestBody } = require('http-proxy-middleware');
-const morgan = require('morgan'); // For logging HTTP requests
+const { createProxyMiddleware } = require('http-proxy-middleware');
+const morgan = require('morgan');
 
 const app = express();
-const PORT = process.env.PORT || 3000; // Use environment variable for PORT or default to 3000
+const port = process.env.PORT || 3000;
+const accessToken = process.env.ACCESS_TOKEN;
+const methods = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'];
 
-// Enable CORS
-app.use(cors());
-
-// Middleware to log HTTP requests
-app.use(morgan('combined'));
-
-// Middleware to parse JSON bodies
-app.use(express.json());
-
-// Authentication middleware
-app.use((req, res, next) => {
-  try {
-    const accessToken = req.body?.accessToken;
-    const VALID_TOKEN = process.env.ACCESS_TOKEN; // Load token from .env
-
-    if (!accessToken) {
-      // Log missing token error
-      console.error('Access token is missing in the request body');
-      return res.status(400).json({ error: 'Access token is required' });
-    }
-
-    if (accessToken !== VALID_TOKEN) {
-      // Log unauthorized access attempt
-      console.error('Unauthorized access attempt with invalid token');
-      return res.status(403).json({ error: 'Unauthorized access' });
-    }
-
-    next();
-  } catch (error) {
-    // Log unexpected errors
-    console.error('Error in authentication middleware:', error.message);
-    res.status(500).json({ error: 'Internal server error' });
+const rules = JSON.parse(process.env.PROXY_RULES || '[]').map((rule) => {
+  const url = new URL(rule.url);
+  const browserOrigins = rule.browserOrigins ?? [];
+  const querySecrets = rule.querySecrets ?? {};
+  if (
+    !['http:', 'https:'].includes(url.protocol) ||
+    url.username || url.password || url.search || url.hash ||
+    !Array.isArray(rule.methods) || !rule.methods.length ||
+    !rule.methods.every((method) => methods.includes(method)) ||
+    !Array.isArray(browserOrigins) ||
+    !browserOrigins.every((origin) => /^https?:\/\//.test(origin) && new URL(origin).origin === origin) ||
+    Object.values(querySecrets).some((name) => typeof name !== 'string' || !process.env[name])
+  ) {
+    throw new Error('Invalid PROXY_RULES entry or missing query secret environment variable');
   }
+  return { url, methods: rule.methods, browserOrigins, querySecrets };
 });
 
+const browserOrigins = new Set(rules.flatMap((rule) => rule.browserOrigins));
+app.use(morgan(':method :status :response-time ms'));
+app.use(cors({
+  origin: (origin, callback) => callback(null, browserOrigins.has(origin)),
+  methods,
+}));
+
+function hasValidToken(req) {
+  const value = req.get('Authorization');
+  if (!accessToken || !value?.startsWith('Bearer ')) return false;
+  const provided = Buffer.from(value.slice('Bearer '.length));
+  const expected = Buffer.from(accessToken);
+  return provided.length === expected.length && timingSafeEqual(provided, expected);
+}
+
 app.use((req, res, next) => {
-  const target = req.query.target;
-  if (target === undefined || target === '') {
-    return res.status(400).json({ error: 'Target query parameter is required' });
-  }
+  if (req.path !== '/') return res.sendStatus(404);
 
-  let url;
+  let target;
   try {
-    if (typeof target === 'string') url = new URL(target);
+    if (typeof req.query.target !== 'string') throw new TypeError();
+    target = new URL(req.query.target);
   } catch {
-    return res.status(400).json({ error: 'Target must be an HTTP or HTTPS URL' });
-  }
-  if (!url || !['http:', 'https:'].includes(url.protocol)) {
-    return res.status(400).json({ error: 'Target must be an HTTP or HTTPS URL' });
+    return res.status(400).json({ error: 'A valid target URL is required' });
   }
 
-  req.proxyTarget = url.href;
-  delete req.body.accessToken;
+  const rule = rules.find((rule) =>
+    !target.username && !target.password && !target.hash &&
+    target.protocol === rule.url.protocol &&
+    target.origin === rule.url.origin &&
+    target.pathname === rule.url.pathname &&
+    rule.methods.includes(req.method)
+  );
+  if (!rule) return res.status(403).json({ error: 'Target or method is not allowed' });
+
+  const origin = req.get('Origin');
+  if (origin && !rule.browserOrigins.includes(origin)) {
+    res.removeHeader('Access-Control-Allow-Origin');
+    return res.status(403).json({ error: 'Origin is not allowed for this target' });
+  }
+  if (!origin && !hasValidToken(req)) {
+    return res.status(401).json({ error: 'A valid bearer token is required' });
+  }
+
+  for (const [parameter, envName] of Object.entries(rule.querySecrets)) {
+    target.searchParams.set(parameter, process.env[envName]);
+  }
+  req.proxyTarget = target;
   next();
 });
 
 app.use(createProxyMiddleware({
   changeOrigin: true,
-  router: (req) => req.proxyTarget,
+  proxyTimeout: 15000,
+  router: (req) => req.proxyTarget.origin,
+  pathRewrite: (_path, req) => req.proxyTarget.pathname + req.proxyTarget.search,
   on: {
-    proxyReq(proxyReq, req) {
-      // The JSON parser inflates compressed bodies before the proxy rewrites them.
-      proxyReq.removeHeader('Content-Encoding');
-      fixRequestBody(proxyReq, req);
+    proxyReq(proxyReq) {
+      proxyReq.removeHeader('Authorization');
+      proxyReq.removeHeader('Cookie');
+      proxyReq.removeHeader('Origin');
+    },
+    proxyRes(proxyRes, req, res) {
+      for (const header of Object.keys(proxyRes.headers)) {
+        if (header.startsWith('access-control-') || header === 'set-cookie') {
+          delete proxyRes.headers[header];
+        }
+      }
+      if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
+        proxyRes.resume();
+        res.status(502).json({ error: 'Upstream redirects are not supported' });
+      }
     },
     error(err, req, res) {
-      console.error('Proxy error:', err.message);
-      if (res.headersSent) {
-        res.destroy(err);
-        return;
-      }
-      res.status(500).json({ error: 'Proxy error occurred' });
+      console.error('Upstream request failed:', err.code || err.name);
+      if (res.headersSent) return res.destroy(err);
+      res.status(502).json({ error: 'Upstream request failed' });
     },
   },
 }));
 
-// Global error handler for unexpected errors
-app.use((err, req, res, next) => {
-  if (res.headersSent) return next(err);
-  if (err.type === 'entity.parse.failed') {
-    return res.status(400).json({ error: 'Invalid JSON body' });
-  }
-  if (err.type === 'entity.too.large') {
-    return res.status(413).json({ error: 'JSON body is too large' });
-  }
-  console.error('Unhandled error:', err.message);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
-// Start the server
-app.listen(PORT, () => {
-  console.log(`CORS Proxy Server running on http://localhost:${PORT}`);
+const server = app.listen(port, () => {
+  console.log(`CORS Proxy Server running on http://localhost:${server.address().port}`);
 });
