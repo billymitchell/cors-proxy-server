@@ -25,8 +25,22 @@ const rules = JSON.parse(process.env.PROXY_RULES || '[]').map((rule) => {
   ) {
     throw new Error('Invalid PROXY_RULES entry or missing query secret environment variable');
   }
-  return { url, methods: rule.methods, browserOrigins, querySecrets };
+  // A rule URL ending in "/*" also allows every sub-path below it.
+  const wildcard = url.pathname.endsWith('/*');
+  const basePath = wildcard ? url.pathname.slice(0, -2) : url.pathname;
+  if (basePath.includes('*')) {
+    throw new Error('Wildcards are only supported as a trailing "/*" in PROXY_RULES urls');
+  }
+  return { url, basePath, wildcard, methods: rule.methods, browserOrigins, querySecrets };
 });
+
+function pathAllowed(rule, pathname) {
+  if (pathname === rule.basePath) return true;
+  if (!rule.wildcard) return false;
+  // Encoded slashes/backslashes could be decoded upstream into a path outside the prefix.
+  if (/%2f|%5c/i.test(pathname)) return false;
+  return pathname.startsWith(rule.basePath.endsWith('/') ? rule.basePath : `${rule.basePath}/`);
+}
 
 const browserOrigins = new Set(rules.flatMap((rule) => rule.browserOrigins));
 app.use(morgan(':method :status :response-time ms'));
@@ -58,7 +72,7 @@ app.use((req, res, next) => {
     !target.username && !target.password && !target.hash &&
     target.protocol === rule.url.protocol &&
     target.origin === rule.url.origin &&
-    target.pathname === rule.url.pathname &&
+    pathAllowed(rule, target.pathname) &&
     rule.methods.includes(req.method)
   );
   if (!rule) return res.status(403).json({ error: 'Target or method is not allowed' });
